@@ -13,14 +13,32 @@ import { listMemories, loadMemory, memoryBlocks, recallMemory, setupMemory } fro
 import { loadInstructions } from "./instructions";
 import { activeSkill, listSkills, loadSkills, unuseSkill, useSkill } from "./skills";
 import { addToRag, loadRag, ragStats, setupRag } from "./rag";
+import { connectMcpServers, mcpStatuses, stopMcpServers } from "./mcp";
+import {
+    createHeadlessTui,
+    execPluginCommand,
+    listPluginCommands,
+    listPlugins,
+    loadPlugins,
+    PluginBaseContext,
+    runPluginExit,
+    runPluginStart,
+} from "./plugin";
 
 // 模型上下文窗口（tokens）
 const CONTEXT_WINDOW = 64000;
 /** 面板内容宽 26 列；「根目录  」占 8 列，剩余 18 列优先留给最后一级目录。 */
 const ROOT_DISPLAY_WIDTH = 18;
 
-if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    console.error("TUI 需要真实终端（TTY）");
+const mode = process.argv[2] ?? "tui";
+if (mode !== "tui" && mode !== "web") {
+    console.error(`未知启动模式：${mode}（可选：web）`);
+    process.exit(1);
+}
+const webMode = mode === "web";
+
+if (!webMode && (!process.stdin.isTTY || !process.stdout.isTTY)) {
+    console.error("Day 11 的 TUI 需要真实终端（TTY）；管道 / 重定向下请运行 day6。");
     process.exit(1);
 }
 
@@ -49,6 +67,11 @@ try {
 } catch (e) {
     console.error(`知识库读取失败（按空知识库继续）：${(e as Error).message}`);
 }
+try {
+    await connectMcpServers();
+} catch (e) {
+    console.error(`MCP 配置读取失败（跳过 MCP，继续启动）：${(e as Error).message}`);
+}
 const chat = new Chat(config.baseURL, config.apiKey, config.model, instructions);
 const sessions = new Sessions();
 await loadSkills();
@@ -58,7 +81,10 @@ const usage = { cum: 0, round: 0, live: 0 };
 
 let busy = false;
 
-const tui = new TUI(onLine, onExit);
+// 服务模式没有真实终端：tui 直接用 headless 顶替——确认自动放行（ask 工具不会挂在
+// 永不出现的终端上），输出落到控制台；web 插件对 ctx.tui.append 的劫持也因此与
+// reply/handleCommand 写的是同一个对象，SSE 桥接照常工作
+const tui = (webMode ? createHeadlessTui() : new TUI(onLine, onExit)) as TUI;
 setupPlanning((task) => chat.delegate(task), updatePanel);
 setupMemory(updatePanel);
 setupRag(updatePanel);
@@ -70,6 +96,18 @@ chat.setUsageListener((u) => {
     usage.round += u.total;
     updatePanel();
 });
+await loadPlugins();
+/** 插件钩子的运行时上下文：输出、运行模式和对话入口。 */
+const pluginCtx: PluginBaseContext = { tui, mode, reply, handleCommand };
+const failedPlugins = await runPluginStart(pluginCtx);
+if (webMode && failedPlugins.includes("web")) process.exit(1);
+
+/** 描述当前 MCP 接入情况：每个 server 的工具数或失败原因。 */
+function mcpLine(): string {
+    const statuses = mcpStatuses();
+    if (statuses.length === 0) return "无";
+    return statuses.map((s) => (s.error ? `${s.server}(启动失败)` : `${s.server}(${s.tools.length})`)).join("、");
+}
 
 // 右侧面板：模型、会话、上下文占用与本轮/累计 tokens
 function buildPanel(): string[] {
@@ -85,6 +123,14 @@ function buildPanel(): string[] {
         `记忆  ${listMemories().length} 条 / ${memoryBlocks()} 块`,
         `指令  ${instructions ? "已加载" : "无"}`,
         `技能  ${activeSkill()?.name ?? "无"}`,
+        `MCP  ${mcpLine()}`,
+        `插件  ${
+            listPlugins().length > 0
+                ? listPlugins()
+                      .map((p) => p.name)
+                      .join("、")
+                : "无"
+        }`,
         "──── 上下文 ────",
         `${ctx} / ${window} tokens`,
         `${Math.ceil((ctx / window) * 100)}% used`,
@@ -111,6 +157,9 @@ function describeActiveSkill(): string {
 }
 
 function printHelp(): void {
+    const pluginCmds = listPluginCommands()
+        .map((c) => `  /${c.name}   ${c.description}`)
+        .join("\n");
     tui.append(
         `可用命令：
   /help    显示帮助
@@ -118,9 +167,12 @@ function printHelp(): void {
   /undo    撤销最近一次 write / patch 写入
   /todos   查看 Agent 当前的 TODO 列表
   /memory  查看跨会话保留的长期记忆
+  /mcp     查看已接入的 MCP server 与工具清单
+  /rag     采集建库（/rag add <URL 或路径>）/查看知识库
   /skills  列出可用技能
   /use     加载技能（/use <名字>）
   /unuse   卸载当前技能
+  /plugins 列出已加载插件与插件命令
   /save    保存全部会话到 .kagent/sessions.json
   /load    从 .kagent/sessions.json 恢复全部会话
   /new <id> 新建并切换到会话
@@ -128,7 +180,7 @@ function printHelp(): void {
   /sessions 列出内存中的会话
   /reset   清空当前会话历史（长期记忆保留）
   /exit    保存全部会话并退出（等价于 Ctrl+C / Ctrl+D）
-工具权限由 .kagent/KAgent.json 的 allow / ask / deny 控制；文件工具只能访问 root 内的路径。
+${pluginCmds ? `插件命令：\n${pluginCmds}\n` : ""}工具权限由 .kagent/KAgent.json 的 allow / ask / deny 控制；文件工具只能访问 root 内的路径。
 右侧面板实时显示本轮 / 累计 tokens 与上下文占用比例：消耗看得见，挤爆之前就知道该压缩了。`,
         "sys",
     );
@@ -224,6 +276,20 @@ async function handleCommand(line: string): Promise<void> {
             tui.append(lines.length > 0 ? `长期记忆：\n${lines.join("\n")}` : "（暂无长期记忆）", "sys");
             break;
         }
+        case "/mcp": {
+            const statuses = mcpStatuses();
+            if (statuses.length === 0) {
+                tui.append("（未接入 MCP server；在 .geekagent/mcp.json 里声明后重启生效）", "sys");
+                break;
+            }
+            const lines = statuses.map((s) =>
+                s.error
+                    ? `× ${s.server}：${s.error}`
+                    : `${s.server}（${s.tools.length} 个工具）\n${s.tools.map((t) => `  ${t}`).join("\n")}`,
+            );
+            tui.append(lines.join("\n"), "sys");
+            break;
+        }
         case "/rag": {
             const args = line.slice("/rag".length).trim();
             if (!args) {
@@ -279,10 +345,32 @@ async function handleCommand(line: string): Promise<void> {
             chat.setSkillInstructions("");
             tui.append("（已卸载技能，恢复默认行为）", "tool");
             break;
+        case "/plugins": {
+            const loaded = listPlugins();
+            if (loaded.length === 0) {
+                tui.append("（plugins/ 目录下暂无插件）", "sys");
+                break;
+            }
+            const pluginLines = loaded.map((p) => {
+                const cmds = (p.commands ?? []).map((c) => `/${c.name}`).join("、");
+                return `${p.name} — ${p.description}${cmds ? `（命令：${cmds}）` : ""}`;
+            });
+            tui.append(`已加载插件（plugins/ 目录）：\n${pluginLines.join("\n")}`, "sys");
+            break;
+        }
         case "/exit":
             await onExit();
             break;
         default:
+            if (command.startsWith("/")) {
+                const cmdName = command.slice(1);
+                const args = line.slice(command.length).trim();
+                const result = await execPluginCommand(cmdName, args);
+                if (result !== null) {
+                    tui.append(result, "sys");
+                    break;
+                }
+            }
             tui.append(`未知命令：${command}（输入 /help 查看）`, "sys");
     }
     updatePanel();
@@ -327,6 +415,8 @@ async function onLine(line: string): Promise<void> {
 }
 
 async function onExit(): Promise<void> {
+    stopMcpServers(); // 关掉 MCP server 子进程
+    await runPluginExit(pluginCtx); // 退出前通知插件
     tui.stop(); // 恢复原来的终端内容后再用 console 打印
     try {
         const generatedId = sessions.nameDefault(chat.exportHistory());
@@ -340,14 +430,13 @@ async function onExit(): Promise<void> {
     process.exit(0);
 }
 
-tui.start();
-updatePanel();
-tui.append("KAgent", "sys");
-const skillNames =
-    listSkills()
-        .map((s) => s.name)
-        .join("、") || "（暂无）";
-tui.append(
-    `可在 skills/ 目录下看到${skillNames}。想看技能长什么样，/skills 列出来、/use <名字> 加载、/unuse 卸载。`,
-    "sys",
-);
+if (webMode) {
+    // 服务模式：插件已在 onStart 里起服务；挂住进程等 Ctrl+C
+    process.once("SIGINT", () => void onExit());
+    process.once("SIGTERM", () => void onExit());
+    await new Promise(() => {});
+} else {
+    tui.start();
+    updatePanel();
+    tui.append("KAgent", "sys");
+}

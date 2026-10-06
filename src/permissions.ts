@@ -74,17 +74,23 @@ export function policyFor(tool: string): Policy {
     return config.tools[tool] ?? "deny";
 }
 
-/** 技能自带的工具不在默认配置里，加载时补一条默认策略（默认 ask），避免被一律 deny 卡死；变更写回配置文件。 */
+/** 配置写盘串行化：调用方无论是否 await，写操作都按序执行，不会并发截断同一文件。 */
+let configWrite: Promise<void> = Promise.resolve();
+
+/** 技能/MCP/插件自带的工具不在默认配置里，加载时补一条默认策略（默认 ask），避免被一律 deny 卡死；变更写回配置文件。 */
 export async function ensureToolPolicy(tool: string, policy: Policy): Promise<void> {
     if (config.tools[tool] !== undefined) return;
     config.tools[tool] = policy;
-    try {
-        await mkdir(dirname(resolve(configPath)), { recursive: true });
-        await writeFile(configPath, `${JSON.stringify({ root: rawRoot, tools: config.tools }, null, 2)}\n`, "utf8");
-    } catch (err) {
-        // 落盘失败只提示，不影响本次会话使用
-        console.error(`权限配置写回失败（新增条目仅会话内生效）：${(err as Error).message}`);
-    }
+    configWrite = configWrite
+        .then(async () => {
+            await mkdir(dirname(resolve(configPath)), { recursive: true });
+            await writeFile(configPath, `${JSON.stringify({ root: rawRoot, tools: config.tools }, null, 2)}\n`, "utf8");
+        })
+        .catch((err) => {
+            // 落盘失败只提示，不影响本次会话使用
+            console.error(`权限配置写回失败（新增条目仅会话内生效）：${(err as Error).message}`);
+        });
+    await configWrite;
 }
 
 export async function authorize(tool: string, prompt = `工具 ${tool} 请求执行`): Promise<boolean> {
