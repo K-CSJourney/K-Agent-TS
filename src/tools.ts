@@ -40,9 +40,33 @@ export interface Tool {
 // 工具注册表。新增工具调用 registerTool
 const registry: Tool[] = [];
 
+/** 当前可见工具的名单；null 表示全部可见（没有技能激活时）。 */
+let visibleTools: string[] | null = null;
+
 export function registerTool(tool: Tool): void {
     if (registry.some((t) => t.name === tool.name)) throw new Error(`工具 ${tool.name} 已注册`);
     registry.push(tool);
+}
+
+/** 技能卸载时移除它自带的工具，让注册表回到加载前的样子。 */
+export function unregisterTool(name: string): void {
+    const index = registry.findIndex((t) => t.name === name);
+    if (index >= 0) registry.splice(index, 1);
+}
+
+/** 技能激活时把可见工具收敛到技能声明的集合；卸载时传 null 恢复全部工具。 */
+export function setVisibleTools(names: string[] | null): void {
+    visibleTools = names;
+}
+
+/** 注册表里是否已有同名工具（技能激活前用它检查命名冲突）。 */
+export function hasTool(name: string): boolean {
+    return registry.some((t) => t.name === name);
+}
+
+/** 当前模型可见工具里是否包含指定工具（未收敛名单时全部可见）。 */
+export function isToolVisible(name: string): boolean {
+    return !visibleTools || visibleTools.includes(name);
 }
 
 /**
@@ -61,9 +85,12 @@ export const BUILTIN_TOOLS: Tool[] = [
         description:
             "在本地执行一条 shell 命令（bash -c），返回合并后的标准输出/错误。执行前会向用户确认。纯查看文件请优先用 ls / read / glob（只读、免确认）。",
         parameters: {
-            command: {
-                type: "string",
-                description: "要执行的 shell 命令",
+            type: "object",
+            properties: {
+                command: {
+                    type: "string",
+                    description: "要执行的 shell 命令",
+                },
             },
             required: ["command"],
             additionalProperties: false,
@@ -344,20 +371,24 @@ export function installCliConfirm(rl: Readline): void {
  * 把内部 Tool 转换为 OpenAI Chat Completions 的 tools 参数格式
  */
 export function toOpenAITools(): ChatCompletionTool[] {
-    return registry.map((tool) => ({
-        type: "function",
-        function: {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-        },
-    }));
+    return registry
+        .filter((tool) => !visibleTools || visibleTools.includes(tool.name))
+        .map((tool) => ({
+            type: "function",
+            function: {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+            },
+        }));
 }
 
 /**
  * 按名字执行工具
  */
 export async function execTool(name: string, argsJson: string): Promise<string> {
+    // 技能白名单是硬边界：提示词里不展示只是第一步，执行层同样拦截
+    if (!isToolVisible(name)) return `权限拒绝：工具 ${name} 不在当前技能的可用工具名单内`;
     const tool = registry.find((t) => t.name == name);
     if (!tool) return `未知工具: ${name}`;
 

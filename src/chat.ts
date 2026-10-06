@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { execTool, toOpenAITools } from "./tools";
+import { execTool, isToolVisible, toOpenAITools } from "./tools";
 
 // 工具调用循环的最多轮数，防止进入死循环
 const MAX_TOOL_TURNS = 5;
@@ -32,6 +32,7 @@ export class Chat {
     private history: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
     // 每次请求拿到用量就回调出去，供 TUI 面板累计显示
     private onUsage?: (u: UsageInfo) => void;
+    private skillInstructions = "";
 
     constructor(baseURL: string, apiKey: string, model: string, instructions: string) {
         this.client = new OpenAI({
@@ -40,6 +41,18 @@ export class Chat {
         });
         this.model = model;
         this.instructions = instructions;
+    }
+
+    private systemPrompt(): string {
+        const skill = this.skillInstructions.trim();
+        return (
+            `${AGENT_SYSTEM}\n\n项目指令（AGENTS.md）：\n${this.instructions || "暂无"}` +
+            (skill ? `\n\n技能指令：\n${skill}` : "")
+        );
+    }
+
+    setSkillInstructions(text: string): void {
+        this.skillInstructions = text;
     }
 
     setUsageListener(fn: (u: UsageInfo) => void): void {
@@ -145,13 +158,14 @@ export class Chat {
                 mustUpdateTodo = false;
                 const stream = await this.client.chat.completions.create({
                     model: this.model,
-                    messages: [
-                        { role: "system", content: `${AGENT_SYSTEM}\n\n项目指令(AGENTS.md): \n${this.instructions}` },
-                        ...this.history,
-                    ],
+                    messages: [{ role: "system", content: this.systemPrompt() }, ...this.history],
                     stream: true,
                     tools: toOpenAITools(),
-                    tool_choice: forceTodo ? { type: "function", function: { name: "todo_write" } } : "auto",
+                    // 只在 todo_write 确实可见时才能强制指定它，否则请求会引用 tools 数组外的工具而被拒绝
+                    tool_choice:
+                        forceTodo && isToolVisible("todo_write")
+                            ? { type: "function", function: { name: "todo_write" } }
+                            : "auto",
                     stream_options: { include_usage: true },
                 });
                 let answer = "";

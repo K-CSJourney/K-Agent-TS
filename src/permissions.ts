@@ -24,9 +24,13 @@ const DEFAULT_TOOLS: Record<string, Policy> = {
 
 let config: PermissionConfig = { root: process.cwd(), tools: DEFAULT_TOOLS };
 let confirmFn: (prompt: string) => Promise<boolean> = async () => false;
+// 记住加载自哪个文件、root 的原始写法，策略变更时按原样写回
+let configPath = ".kagent/KAgent.json";
+let rawRoot = "..";
 
 /** 配置不存在时写入默认权限；存在但写错时直接报错，不静默放宽。 */
 export async function loadPermissions(file = ".kagent/KAgent.json"): Promise<PermissionConfig> {
+    configPath = file;
     let raw: string;
     try {
         raw = await readFile(file, "utf8");
@@ -43,6 +47,7 @@ export async function loadPermissions(file = ".kagent/KAgent.json"): Promise<Per
         throw new Error("KAgent.json 的 tools 必须是对象");
     }
     const tools = { ...DEFAULT_TOOLS };
+    rawRoot = value.root;
     for (const [name, policy] of Object.entries(value.tools)) {
         if (policy !== "ask" && policy !== "allow" && policy !== "deny") {
             throw new Error(`工具 ${name} 的策略必须是 ask / allow / deny`);
@@ -63,6 +68,19 @@ export function permissionRoot(): string {
 
 export function policyFor(tool: string): Policy {
     return config.tools[tool] ?? "deny";
+}
+
+/** 技能自带的工具不在默认配置里，加载时补一条默认策略（默认 ask），避免被一律 deny 卡死；变更写回配置文件。 */
+export async function ensureToolPolicy(tool: string, policy: Policy): Promise<void> {
+    if (config.tools[tool] !== undefined) return;
+    config.tools[tool] = policy;
+    try {
+        await mkdir(dirname(resolve(configPath)), { recursive: true });
+        await writeFile(configPath, `${JSON.stringify({ root: rawRoot, tools: config.tools }, null, 2)}\n`, "utf8");
+    } catch (err) {
+        // 落盘失败只提示，不影响本次会话使用
+        console.error(`权限配置写回失败（新增条目仅会话内生效）：${(err as Error).message}`);
+    }
 }
 
 export async function authorize(tool: string, prompt = `工具 ${tool} 请求执行`): Promise<boolean> {

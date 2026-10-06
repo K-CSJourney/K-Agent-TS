@@ -11,6 +11,7 @@ import { undo } from "./undo";
 import { formatTodos, setupPlanning } from "./todos";
 import { listMemories, loadMemory, setupMemory } from "./memory";
 import { loadInstructions } from "./instructions";
+import { activeSkill, listSkills, loadSkills, unuseSkill, useSkill } from "./skills";
 
 // 模型上下文窗口（tokens）
 const CONTEXT_WINDOW = 64000;
@@ -44,6 +45,7 @@ try {
 }
 const chat = new Chat(config.baseURL, config.apiKey, config.model, instructions);
 const sessions = new Sessions();
+await loadSkills();
 
 /** 用量状态：live 是流式进行中按字符估算的增量；正式总数以接口 usage 为准。 */
 const usage = { cum: 0, round: 0, live: 0 };
@@ -75,6 +77,7 @@ function buildPanel(): string[] {
         `根目录  ${shownRoot}`,
         `记忆  ${listMemories().length} 条`,
         `指令  ${instructions ? "已加载" : "无"}`,
+        `技能  ${activeSkill()?.name ?? "无"}`,
         "──── 上下文 ────",
         `${ctx} / ${window} tokens`,
         `${Math.ceil((ctx / window) * 100)}% used`,
@@ -91,19 +94,34 @@ function updatePanel(): void {
     tui.setPanel(buildPanel());
 }
 
+function describeActiveSkill(): string {
+    const skill = activeSkill();
+    if (!skill) return "无";
+    const parts: string[] = [];
+    if (skill.tools.length) parts.push(`自带工具：${skill.tools.map((t) => t.name).join("、")}`);
+    if (skill.builtinTools.length) parts.push(`内置工具：${skill.builtinTools.join("、")}`);
+    return parts.length ? `${skill.name}（${parts.join("；")}）` : skill.name;
+}
+
 function printHelp(): void {
     tui.append(
         `可用命令：
   /help    显示帮助
   /compact 立即压缩旧对话摘要（不等自动触发）
-  /save    保存全部会话到 .geekagent/sessions.json
-  /load    从 .geekagent/sessions.json 恢复全部会话
+  /undo    撤销最近一次 write / patch 写入
+  /todos   查看 Agent 当前的 TODO 列表
+  /memory  查看跨会话保留的长期记忆
+  /skills  列出可用技能
+  /use     加载技能（/use <名字>）
+  /unuse   卸载当前技能
+  /save    保存全部会话到 .kagent/sessions.json
+  /load    从 .kagent/sessions.json 恢复全部会话
   /new <id> 新建并切换到会话
   /open <id> 切换会话
   /sessions 列出内存中的会话
-  /reset   清空当前会话记忆
+  /reset   清空当前会话历史（长期记忆保留）
   /exit    保存全部会话并退出（等价于 Ctrl+C / Ctrl+D）
-已接入工具：get_current_time（当前时间）、run_shell（执行 shell，需确认）、ls / read / glob（只读、免确认）、write / patch（写入前展示 diff 并确认）。
+工具权限由 .kagent/KAgent.json 的 allow / ask / deny 控制；文件工具只能访问 root 内的路径。
 右侧面板实时显示本轮 / 累计 tokens 与上下文占用比例：消耗看得见，挤爆之前就知道该压缩了。`,
         "sys",
     );
@@ -199,6 +217,34 @@ async function handleCommand(line: string): Promise<void> {
             tui.append(lines.length > 0 ? `长期记忆：\n${lines.join("\n")}` : "（暂无长期记忆）", "sys");
             break;
         }
+        case "/skills": {
+            const lines = listSkills().map((s) => `${activeSkill()?.name === s.name ? "*" : " "} ${s.name} — ${s.description}`);
+            tui.append(
+                lines.length > 0
+                    ? `可用技能（skills/ 目录，/use 加载）：\n${lines.join("\n")}`
+                    : "（skills/ 目录下暂无技能）",
+                "sys",
+            );
+            break;
+        }
+        case "/use":
+            if (!id) {
+                tui.append("用法：/use <技能名>（/skills 查看可用技能）", "sys");
+                break;
+            }
+            try {
+                await useSkill(id);
+                chat.setSkillInstructions(activeSkill()?.instructions ?? "");
+                tui.append(`已加载技能 ${describeActiveSkill()}`, "tool");
+            } catch (e) {
+                tui.append(`加载失败：${(e as Error).message}`, "sys");
+            }
+            break;
+        case "/unuse":
+            unuseSkill();
+            chat.setSkillInstructions("");
+            tui.append("（已卸载技能，恢复默认行为）", "tool");
+            break;
         case "/exit":
             await onExit();
             break;
@@ -262,4 +308,8 @@ async function onExit(): Promise<void> {
 tui.start();
 updatePanel();
 tui.append("KAgent", "sys");
-tui.append("输入 /help 查看命令；右侧面板实时显示用量。", "sys");
+const skillNames = listSkills().map((s) => s.name).join("、") || "（暂无）";
+tui.append(
+    `可在 skills/ 目录下看到${skillNames}。想看技能长什么样，/skills 列出来、/use <名字> 加载、/unuse 卸载。`,
+    "sys",
+);
