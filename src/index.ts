@@ -1,12 +1,18 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { Chat } from "./chat";
 import { loadConfig } from "./config";
+import { loadPermissions, permissionRoot, setupPermissions } from "./permissions";
 import { Sessions } from "./sessions";
 import { loadSessions, saveSessions } from "./storage";
 import { setConfirmFn } from "./tools";
 import { estimateTokens, TUI } from "./tui";
+import { basename } from "path";
+import { undo } from "./undo";
 
 // 模型上下文窗口（tokens）
 const CONTEXT_WINDOW = 64000;
+/** 面板内容宽 26 列；「根目录  」占 8 列，剩余 18 列优先留给最后一级目录。 */
+const ROOT_DISPLAY_WIDTH = 18;
 
 if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.error("TUI 需要真实终端（TTY）");
@@ -14,6 +20,13 @@ if (!process.stdin.isTTY || !process.stdout.isTTY) {
 }
 
 const config = loadConfig();
+let permissions;
+try {
+    permissions = await loadPermissions();
+} catch (e) {
+    console.error(`.kagent/KAgent.json 读取失败：${(e as Error).message}`);
+    process.exit(1);
+}
 const chat = new Chat(config.baseURL, config.apiKey, config.model);
 const sessions = new Sessions();
 
@@ -23,6 +36,7 @@ const usage = { cum: 0, round: 0, live: 0 };
 let busy = false;
 
 const tui = new TUI(onLine, onExit);
+setupPermissions(permissions, (prompt) => tui.confirm(prompt));
 setConfirmFn((prompt) => tui.confirm(prompt));
 chat.setUsageListener((u) => {
     usage.live = 0;
@@ -35,6 +49,8 @@ chat.setUsageListener((u) => {
 function buildPanel(): string[] {
     const window = CONTEXT_WINDOW;
     const ctx = estimateTokens(JSON.stringify(chat.exportHistory()));
+    const root = permissionRoot();
+    const shownRoot = visibleWidth(root) <= ROOT_DISPLAY_WIDTH ? root : `…/${basename(root)}`;
     return [
         `模型  ${config.model}`,
         `会话  ${sessions.currentId()}`,
@@ -140,6 +156,13 @@ async function handleCommand(line: string): Promise<void> {
                 tui.append(`（已切换到会话 ${id}，${messages.length} 条消息）`, "sys");
             } catch (e) {
                 tui.append(`打开失败：${(e as Error).message}`, "sys");
+            }
+            break;
+        case "/undo":
+            try {
+                tui.append(`（${await undo()}）`, "sys");
+            } catch (e) {
+                tui.append(`撤销失败：${(e as Error).message}`, "sys");
             }
             break;
         case "/exit":

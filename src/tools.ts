@@ -5,6 +5,8 @@ import { ChatCompletionTool } from "openai/resources/chat/completions";
 import { out } from "./color";
 import { glob, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { authorize, permissionRoot, policyFor, redact, safeGlob, safePath } from "./permissions";
+import { backup } from "./undo";
 
 const execAsync = promisify(exec);
 
@@ -31,6 +33,8 @@ export interface Tool {
     description: string;
     parameters: Record<string, unknown>;
     run(args: Record<string, unknown>): Promise<string> | string;
+    // 工具内部需要先构造 diff 等详细提示时，自行调用 authorize
+    authorizes?: boolean;
 }
 
 // 工具注册表。新增工具调用 registerTool
@@ -82,6 +86,7 @@ export const BUILTIN_TOOLS: Tool[] = [
                 return truncate(`命令执行失败(${err.message})\n${partial}`);
             }
         },
+        authorizes: true,
     },
     {
         name: "ls",
@@ -92,8 +97,8 @@ export const BUILTIN_TOOLS: Tool[] = [
             additionalProperties: false,
         },
         run: async (args) => {
-            const dir = String(args.path ?? ".").trim() || ".";
             try {
+                const dir = await safePath(String(args.path ?? ".").trim() || ".");
                 const entries = await readdir(dir, { withFileTypes: true });
                 if (entries.length === 0) return "(空目录)";
                 const lines = entries
@@ -102,6 +107,36 @@ export const BUILTIN_TOOLS: Tool[] = [
                 return `共 ${lines.length} 项：\n${lines.join("\n")}`;
             } catch (err) {
                 return `打开目录失败：${(err as NodeJS.ErrnoException).message}`;
+            }
+        },
+    },
+    {
+        name: "read",
+        description: "读取文本文件内容（只读）。文件过大时自动截断，可用 offset 从指定字符偏移处分段续读。",
+        parameters: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "要读取的文件路径。" },
+                offset: { type: "number", description: "从第 offset 个字符开始读，默认 0；用于分段读大文件。" },
+            },
+            required: ["path"],
+            additionalProperties: false,
+        },
+        run: async (args) => {
+            const input = String(args.path ?? "").trim();
+            if (!input) return "缺少参数 path";
+            const offset = Math.max(0, Number(args.offset) || 0);
+            try {
+                const file = await safePath(input);
+                const text = await readFile(file, "utf8");
+                if (offset >= text.length) return "offset 已越过文件末尾";
+                const slice = text.slice(offset, offset + MAX_OUTPUT_CHARS);
+                const truncated = offset + slice.length < text.length;
+                const meta = `（文件共 ${text.length} 字符，已读第 ${offset}-${offset + slice.length} 段）\n`;
+                const hint = truncated ? `\n...(已截断，续读可用 offset=${offset + slice.length})` : "";
+                return meta + slice + hint;
+            } catch (err) {
+                return `读取文件失败：${(err as NodeJS.ErrnoException).message}`;
             }
         },
     },
@@ -116,12 +151,12 @@ export const BUILTIN_TOOLS: Tool[] = [
             additionalProperties: false,
         },
         run: async (args) => {
-            const pattern = String(args.pattern ?? "").trim();
+            const pattern = safeGlob(String(args.pattern ?? "").trim());
             if (!pattern) return "缺少参数 pattern";
             try {
                 const files: string[] = [];
                 for await (const p of glob(pattern, {
-                    cwd: process.cwd(),
+                    cwd: permissionRoot(),
                     exclude: (dir) => dir.includes("node_modules"),
                 })) {
                     files.push(p.replaceAll("\\", "/"));
@@ -155,9 +190,10 @@ export const BUILTIN_TOOLS: Tool[] = [
         run: async (args) => {
             const file = String(args.path ?? "").trim();
             if (!file) return "缺少参数 path";
-            const wrote = await commitWrite(file, String(args.content ?? ""));
+            const wrote = await commitWrite("write", file, String(args.content ?? ""));
             return wrote ? `已写入 ${file}` : "已取消写入";
         },
+        authorizes: true,
     },
     {
         name: "patch",
@@ -188,8 +224,9 @@ export const BUILTIN_TOOLS: Tool[] = [
             additionalProperties: false,
         },
         run: async (args) => {
-            const file = String(args.path ?? "").trim();
-            if (!file) return "缺少参数 path";
+            const rawPath = String(args.path ?? "").trim();
+            if (!rawPath) return "缺少参数 path";
+            const file = await safePath(rawPath);
             const hunks = (Array.isArray(args.hunks) ? args.hunks : []) as PatchHunk[];
             if (hunks.length === 0) return "hunks 为空，未做任何修改";
             let original: string;
@@ -208,9 +245,10 @@ export const BUILTIN_TOOLS: Tool[] = [
                 patched = patched.slice(0, i) + h.new + patched.slice(i + h.old.length);
             }
             if (patched === original) return "替换后内容与原文件一致，未做任何修改";
-            const wrote = await commitWrite(file, patched);
+            const wrote = await commitWrite("patch", file, patched);
             return wrote ? `已应用 ${hunks.length} 处修改到 ${file}` : "已取消修改";
         },
+        authorizes: true,
     },
 ];
 
@@ -250,15 +288,17 @@ function simpleDiff(oldText: string, newText: string): string {
 }
 
 /** 展示 diff 并确认后写盘；新文件也照常走此流程。内容没变则不打扰用户，直接返回成功。 */
-async function commitWrite(file: string, next: string): Promise<boolean> {
+async function commitWrite(tool: "write" | "patch", rawFile: string, next: string): Promise<boolean> {
+    const file = await safePath(rawFile);
     let oldtxt = "";
     try {
         oldtxt = await readFile(file, "utf8");
-    } catch {
-        /* 新文件：旧内容视为空 */
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
     if (oldtxt === next) return true;
-    if (!(await confirm(`\n${simpleDiff(oldtxt, next)}\n确认写入 ${file}？`))) return false;
+    if (!(await authorize(tool, `\n${simpleDiff(oldtxt ?? "", next)}\n确认写入 ${file}？`))) return false;
+    await backup(file, oldtxt);
     await mkdir(dirname(file), { recursive: true });
     await writeFile(file, next);
     return true;
@@ -325,12 +365,14 @@ export async function execTool(name: string, argsJson: string): Promise<string> 
     try {
         args = argsJson ? JSON.parse(argsJson) : {};
     } catch {
-        return `参数是非法 JSON: ${argsJson}`;
+        return redact(`参数不是合法 JSON：${argsJson}`);
     }
 
     try {
-        return await tool.run(args);
+        if (policyFor(name) === "deny") return `权限拒绝：工具 ${name} 不允许执行`;
+        if (!tool.authorizes && !(await authorize(name))) return `权限拒绝：工具 ${name} 不允许执行`;
+        return redact(await tool.run(args));
     } catch (e) {
-        return `工具执行失败: ${(e as Error).message}`;
+        return redact(`工具执行失败：${(e as Error).message}`);
     }
 }
