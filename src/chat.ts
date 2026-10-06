@@ -30,6 +30,14 @@ export class Chat {
         this.model = model;
     }
 
+    exportHistory(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+        return this.history;
+    }
+
+    importHistory(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): void {
+        this.history = messages;
+    }
+
     /**
      * history 的粗略体积：按消息序列化后的字符数估算，超出 MAX_HISTORY_CHARS 即需压缩
      */
