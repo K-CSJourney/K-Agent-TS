@@ -4,6 +4,19 @@ import { execTool, toOpenAITools } from "./tools";
 // 工具调用循环的最多轮数，防止进入死循环
 const MAX_TOOL_TURNS = 5;
 
+// 触发历史压缩的字符阈值
+const MAX_HISTORY_CHARS = Number(process.env.KAGENT_MAX_HISTORY) || 4000;
+
+/** 压缩时保留最近几条完整消息，只摘要更早的——刚发生的对话需要原样细节，久远的才值得变薄。 */
+const KEEP_RECENT = 6;
+
+/** 历史压缩的指令：把旧对话压成要点，浓缩关键事实、决定与未完成事项。 */
+const COMPRESS_SYSTEM = `你是对话压缩器。把用户贴出的历史对话压缩成简洁的中文要点，尽量保留以下信息：
+- 用户的目标、需求、做过的决定与偏好；
+- 出现过的文件路径、shell 命令、工具调用与关键结论；
+- 尚未完成、仍在推进中的事项。
+只输出压缩后的要点，不要解释、不要寒暄、不要保留逐字对话。`;
+
 export class Chat {
     private client: OpenAI;
     private model: string;
@@ -18,6 +31,52 @@ export class Chat {
     }
 
     /**
+     * history 的粗略体积：按消息序列化后的字符数估算，超出 MAX_HISTORY_CHARS 即需压缩
+     */
+    private historySize(): number {
+        return this.history.reduce((n, m) => n + JSON.stringify(m).length, 0);
+    }
+
+    /**
+     * 历史压缩：把除最近 KEEP_RECENT 条以外的旧消息交给模型摘要，
+     * 用一条 system 摘要消息替换它们，让上下文变薄。
+     * 返回被合并掉的旧消息条数；模型没产出摘要时返回 0，本次不做替换。
+     */
+    private async compactOldMessages(): Promise<number> {
+        const split = this.history.length - KEEP_RECENT;
+        if (split <= 0) return 0; // 历史还不够长，无旧消息可压
+        const old = this.history.slice(0, split);
+        const recent = this.history.slice(split);
+        const res = await this.client.chat.completions.create({
+            model: this.model,
+            messages: [
+                { role: "system", content: COMPRESS_SYSTEM },
+                { role: "user", content: JSON.stringify(old, null, 2) },
+            ],
+        });
+        const text = res.choices[0]?.message?.content?.trim();
+        if (!text) return 0;
+        this.history = [{ role: "system", content: `【此前对话摘要】\n${text}` }, ...recent];
+        return old.length;
+    }
+
+    /**
+     * 主动压缩：随时把旧消息摘成一条摘要，不等历史超阈值（/compact 命令调用）。
+     * 返回给用户看的提示文案，不带方括号；压缩失败不抛错，返回失败说明。
+     */
+    async compact(): Promise<string> {
+        if (this.history.length <= KEEP_RECENT) return "历史压缩：没有可压缩的旧消息";
+        try {
+            const dropped = await this.compactOldMessages();
+            return dropped > 0
+                ? `历史压缩：${dropped} 条旧消息合并为 1 条摘要`
+                : "历史压缩：模型未产出摘要，保留原历史";
+        } catch {
+            return "历史压缩失败：保留原历史";
+        }
+    }
+
+    /**
      * 携带 history 发送用户输入，逐段增量产出回复内容；结束后把完整回答写入 history
      * @param userInput 用户输入
      */
@@ -27,6 +86,17 @@ export class Chat {
             content: userInput,
         });
         try {
+            // 历史超长时先把旧消息压成摘要，腾出上下文给本轮；压缩失败也不打断对话
+            if (this.historySize() > MAX_HISTORY_CHARS) {
+                try {
+                    const dropped = await this.compactOldMessages();
+                    yield dropped > 0
+                        ? `\n[历史压缩：${dropped} 条旧消息合并为 1 条摘要]\n`
+                        : "\n[历史压缩：模型未产出摘要，保留原历史]\n";
+                } catch {
+                    yield "\n[历史压缩失败：保留原历史]\n";
+                }
+            }
             for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
                 const stream = await this.client.chat.completions.create({
                     model: this.model,

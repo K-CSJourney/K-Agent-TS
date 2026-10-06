@@ -43,6 +43,10 @@ rl.on("line", async (raw) => {
                     chat.reset();
                     out("sys", "（已清空对话记忆）", true);
                     break;
+                case "/compact":
+                    out("sys", "\n"); // 压缩进度另起一行
+                    out("tool", `[${await chat.compact()}]`, true);
+                    break;
                 case "/exit":
                     rl.close();
                     return;
@@ -53,7 +57,9 @@ rl.on("line", async (raw) => {
             try {
                 out("sys", "\n"); // 模型回复另起一行
                 for await (const delta of chat.streamReply(line)) {
-                    out(delta.startsWith("\n[调用工具") ? "tool" : "model", delta);
+                    // 进度行（工具调用 / 历史压缩）用黄色，真正的回复用绿色
+                    const isProgress = delta.startsWith("\n[调用工具") || delta.startsWith("\n[历史压缩");
+                    out(isProgress ? "tool" : "model", delta);
                 }
                 out("sys", "\n");
             } catch (e) {
