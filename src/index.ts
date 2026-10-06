@@ -50,7 +50,7 @@ rl.on("line", async (raw) => {
             try {
                 out("sys", "\n"); // 模型回复另起一行
                 for await (const delta of chat.streamReply(line)) {
-                    out("model", delta);
+                    out(delta.startsWith("\n[调用工具") ? "tool" : "model", delta);
                 }
                 out("sys", "\n");
             } catch (e) {
