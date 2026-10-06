@@ -4,6 +4,13 @@ import { execTool, toOpenAITools } from "./tools";
 // 工具调用循环的最多轮数，防止进入死循环
 const MAX_TOOL_TURNS = 5;
 
+/** 单次请求的用量信息（同 OpenAI 的 usage 字段）。 */
+export interface UsageInfo {
+    prompt: number;
+    completion: number;
+    total: number;
+}
+
 // 触发历史压缩的字符阈值
 const MAX_HISTORY_CHARS = Number(process.env.KAGENT_MAX_HISTORY) || 4000;
 
@@ -21,6 +28,8 @@ export class Chat {
     private client: OpenAI;
     private model: string;
     private history: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+    // 每次请求拿到用量就回调出去，供 TUI 面板累计显示
+    private onUsage?: (u: UsageInfo) => void;
 
     constructor(baseURL: string, apiKey: string, model: string) {
         this.client = new OpenAI({
@@ -28,6 +37,10 @@ export class Chat {
             apiKey,
         });
         this.model = model;
+    }
+
+    setUsageListener(fn: (u: UsageInfo) => void): void {
+        this.onUsage = fn;
     }
 
     exportHistory(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
@@ -62,6 +75,7 @@ export class Chat {
                 { role: "user", content: JSON.stringify(old, null, 2) },
             ],
         });
+        this.reportUsage(res.usage);
         const text = res.choices[0]?.message?.content?.trim();
         if (!text) return 0;
         this.history = [{ role: "system", content: `【此前对话摘要】\n${text}` }, ...recent];
@@ -111,6 +125,7 @@ export class Chat {
                     messages: this.history,
                     stream: true,
                     tools: toOpenAITools(),
+                    stream_options: { include_usage: true },
                 });
                 let answer = "";
                 const calls = new Map<number, { id: string; name: string; args: string }>();
@@ -130,6 +145,7 @@ export class Chat {
                         if (tc.function?.name) call.name += tc.function.name;
                         if (tc.function?.arguments) call.args += tc.function.arguments;
                     }
+                    if (chunk.usage) this.reportUsage(chunk.usage); // 只有最后一个 chunk 才带 usage
                 }
 
                 const toolCalls = [...calls.values()];
@@ -148,7 +164,7 @@ export class Chat {
                     });
                     for (const c of toolCalls) {
                         const result = await execTool(c.name, c.args);
-                        yield `\n调用工具 ${c.name} → ${result}\n`;
+                        yield `\n[调用工具 ${c.name} → ${result}]\n`;
                         this.history.push({ role: "tool", tool_call_id: c.id, content: result });
                     }
                     continue;
@@ -167,6 +183,16 @@ export class Chat {
             this.history.pop();
             throw e;
         }
+    }
+
+    /** 把接口返回的 usage 归一化成 UsageInfo，回调给外部累计。 */
+    private reportUsage(usage: OpenAI.CompletionUsage | null | undefined): void {
+        if (!usage) return;
+        this.onUsage?.({
+            prompt: usage.prompt_tokens,
+            completion: usage.completion_tokens,
+            total: usage.total_tokens,
+        });
     }
 
     reset(): void {
