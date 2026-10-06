@@ -9,7 +9,7 @@ import { estimateTokens, TUI } from "./tui";
 import { basename } from "path";
 import { undo } from "./undo";
 import { formatTodos, setupPlanning } from "./todos";
-import { listMemories, loadMemory, setupMemory } from "./memory";
+import { listMemories, loadMemory, memoryBlocks, recallMemory, setupMemory } from "./memory";
 import { loadInstructions } from "./instructions";
 import { activeSkill, listSkills, loadSkills, unuseSkill, useSkill } from "./skills";
 
@@ -75,7 +75,7 @@ function buildPanel(): string[] {
         `模型  ${config.model}`,
         `会话  ${sessions.currentId()}`,
         `根目录  ${shownRoot}`,
-        `记忆  ${listMemories().length} 条`,
+        `记忆  ${listMemories().length} 条 / ${memoryBlocks()} 块`,
         `指令  ${instructions ? "已加载" : "无"}`,
         `技能  ${activeSkill()?.name ?? "无"}`,
         "──── 上下文 ────",
@@ -218,7 +218,9 @@ async function handleCommand(line: string): Promise<void> {
             break;
         }
         case "/skills": {
-            const lines = listSkills().map((s) => `${activeSkill()?.name === s.name ? "*" : " "} ${s.name} — ${s.description}`);
+            const lines = listSkills().map(
+                (s) => `${activeSkill()?.name === s.name ? "*" : " "} ${s.name} — ${s.description}`,
+            );
             tui.append(
                 lines.length > 0
                     ? `可用技能（skills/ 目录，/use 加载）：\n${lines.join("\n")}`
@@ -256,6 +258,7 @@ async function handleCommand(line: string): Promise<void> {
 
 async function reply(line: string): Promise<void> {
     usage.round = 0;
+    chat.setRecall(recallMemory(line)); // 自动唤起：用户一开口，相关记忆先进 system prompt
     try {
         tui.append("", "sys"); // 回复前空一行，把上一段对话隔开
         for await (const delta of chat.streamReply(line)) {
@@ -308,7 +311,10 @@ async function onExit(): Promise<void> {
 tui.start();
 updatePanel();
 tui.append("KAgent", "sys");
-const skillNames = listSkills().map((s) => s.name).join("、") || "（暂无）";
+const skillNames =
+    listSkills()
+        .map((s) => s.name)
+        .join("、") || "（暂无）";
 tui.append(
     `可在 skills/ 目录下看到${skillNames}。想看技能长什么样，/skills 列出来、/use <名字> 加载、/unuse 卸载。`,
     "sys",
