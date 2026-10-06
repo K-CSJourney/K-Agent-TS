@@ -9,6 +9,8 @@ import { estimateTokens, TUI } from "./tui";
 import { basename } from "path";
 import { undo } from "./undo";
 import { formatTodos, setupPlanning } from "./todos";
+import { listMemories, loadMemory, setupMemory } from "./memory";
+import { loadInstructions } from "./instructions";
 
 // 模型上下文窗口（tokens）
 const CONTEXT_WINDOW = 64000;
@@ -28,7 +30,19 @@ try {
     console.error(`.kagent/KAgent.json 读取失败：${(e as Error).message}`);
     process.exit(1);
 }
-const chat = new Chat(config.baseURL, config.apiKey, config.model);
+let instructions = "";
+// 记忆与项目指令都是可选的便利数据：单个文件损坏只降级为空并告警，不阻断启动
+try {
+    await loadMemory();
+} catch (e) {
+    console.error(`长期记忆加载失败（按空记忆继续）：${(e as Error).message}`);
+}
+try {
+    instructions = await loadInstructions(permissions.root);
+} catch (e) {
+    console.error(`项目指令（AGENTS.md）加载失败（忽略）：${(e as Error).message}`);
+}
+const chat = new Chat(config.baseURL, config.apiKey, config.model, instructions);
 const sessions = new Sessions();
 
 /** 用量状态：live 是流式进行中按字符估算的增量；正式总数以接口 usage 为准。 */
@@ -38,6 +52,7 @@ let busy = false;
 
 const tui = new TUI(onLine, onExit);
 setupPlanning((task) => chat.delegate(task), updatePanel);
+setupMemory(updatePanel);
 setupPermissions(permissions, (prompt) => tui.confirm(prompt));
 setConfirmFn((prompt) => tui.confirm(prompt));
 chat.setUsageListener((u) => {
@@ -58,6 +73,8 @@ function buildPanel(): string[] {
         `模型  ${config.model}`,
         `会话  ${sessions.currentId()}`,
         `根目录  ${shownRoot}`,
+        `记忆  ${listMemories().length} 条`,
+        `指令  ${instructions ? "已加载" : "无"}`,
         "──── 上下文 ────",
         `${ctx} / ${window} tokens`,
         `${Math.ceil((ctx / window) * 100)}% used`,
@@ -174,6 +191,12 @@ async function handleCommand(line: string): Promise<void> {
         case "/todos": {
             const todos = formatTodos();
             tui.append(todos.length > 0 ? `TODO：\n${todos.join("\n")}` : "（暂无 TODO）", "sys");
+            break;
+        }
+        case "/memory": {
+            const memories = listMemories();
+            const lines = memories.map((item, i) => `${i + 1}. ${item}`);
+            tui.append(lines.length > 0 ? `长期记忆：\n${lines.join("\n")}` : "（暂无长期记忆）", "sys");
             break;
         }
         case "/exit":

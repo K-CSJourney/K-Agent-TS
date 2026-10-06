@@ -4,8 +4,7 @@ import { execTool, toOpenAITools } from "./tools";
 // 工具调用循环的最多轮数，防止进入死循环
 const MAX_TOOL_TURNS = 5;
 
-const AGENT_SYSTEM = `你是一个本地编码 Agent。遇到需要多个步骤的任务时，先调用 todo_write 制定简短计划，再逐项执行并更新状态；用户明确要求 TODO 或任务清单时，必须先调用 todo_write。简单任务直接完成，不要为了形式创建 TODO。可把边界清楚的分析、设计或审查任务交给 delegate_task，多个子任务必须串行委派。`;
-
+const AGENT_SYSTEM = `你是一个本地编码 Agent。遇到需要多个步骤的任务时，先调用 todo_write 制定简短计划，再逐项执行并更新状态；用户明确要求 TODO 或任务清单时，必须先调用 todo_write。简单任务直接完成，不要为了形式创建 TODO。可把边界清楚的分析、设计或审查任务交给 delegate_task，多个子任务必须串行委派。用户偏好、项目事实或重要决定值得跨会话保留时，调用 memory_write；需要回忆这些信息时调用 memory_search，不要假设记忆内容。不要记录临时任务进度或可随时从文件读到的内容。`;
 /** 单次请求的用量信息（同 OpenAI 的 usage 字段）。 */
 export interface UsageInfo {
     prompt: number;
@@ -29,16 +28,18 @@ const COMPRESS_SYSTEM = `你是对话压缩器。把用户贴出的历史对话�
 export class Chat {
     private client: OpenAI;
     private model: string;
+    private instructions: string;
     private history: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
     // 每次请求拿到用量就回调出去，供 TUI 面板累计显示
     private onUsage?: (u: UsageInfo) => void;
 
-    constructor(baseURL: string, apiKey: string, model: string) {
+    constructor(baseURL: string, apiKey: string, model: string, instructions: string) {
         this.client = new OpenAI({
             baseURL,
             apiKey,
         });
         this.model = model;
+        this.instructions = instructions;
     }
 
     setUsageListener(fn: (u: UsageInfo) => void): void {
@@ -144,7 +145,10 @@ export class Chat {
                 mustUpdateTodo = false;
                 const stream = await this.client.chat.completions.create({
                     model: this.model,
-                    messages: [{ role: "system", content: AGENT_SYSTEM }, ...this.history],
+                    messages: [
+                        { role: "system", content: `${AGENT_SYSTEM}\n\n项目指令(AGENTS.md): \n${this.instructions}` },
+                        ...this.history,
+                    ],
                     stream: true,
                     tools: toOpenAITools(),
                     tool_choice: forceTodo ? { type: "function", function: { name: "todo_write" } } : "auto",

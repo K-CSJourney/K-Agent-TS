@@ -18,6 +18,8 @@ const DEFAULT_TOOLS: Record<string, Policy> = {
     patch: "ask",
     todo_write: "allow",
     delegate_task: "allow",
+    memory_write: "allow",
+    memory_search: "allow",
 };
 
 let config: PermissionConfig = { root: process.cwd(), tools: DEFAULT_TOOLS };
