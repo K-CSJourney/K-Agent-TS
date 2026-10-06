@@ -22,6 +22,8 @@ const DEFAULT_TOOLS: Record<string, Policy> = {
     delegate_task: "allow",
     memory_write: "allow",
     memory_search: "allow",
+    rag_add: "ask",
+    rag_search: "allow",
 };
 
 let config: PermissionConfig = { root: process.cwd(), tools: DEFAULT_TOOLS };

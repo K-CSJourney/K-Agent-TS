@@ -23,7 +23,7 @@ const MAX_SEARCH_RESULTS = 50;
 /** search 只扫不超过这个字节数的文本文件，跳过体积可疑的大文件。 */
 const MAX_SEARCH_FILE_SIZE = 1024 * 1024;
 /** fetch 最长的等待时间，超时按失败处理。 */
-const FETCH_TIMEOUT_MS = 15_000;
+export const FETCH_TIMEOUT_MS = 15_000;
 /** fetch 单次最多缓冲的字节数，防止大响应把内存吃满（展示本来就只取片段）。 */
 const MAX_FETCH_BYTES = 2 * 1024 * 1024;
 /** fetch 最多跟随的重定向次数，防循环跳转。 */
@@ -262,52 +262,20 @@ export const BUILTIN_TOOLS: Tool[] = [
             const input = String(args.url ?? "").trim();
             if (!input) return "缺少参数 url";
             const offset = Math.max(0, Number(args.offset) || 0);
-            let target: URL;
             try {
-                target = new URL(input);
-            } catch {
-                return `URL 不合法：${input}`;
-            }
-            if (target.protocol !== "http:" && target.protocol !== "https:") return "只支持 http/https 链接";
-            try {
-                // 重定向手动跟随：每一跳都是新地址，必须重新确认，不能让 302 绕过按 URL 的授权
-                const visited = new Set([target.href]);
-                let res: Response;
-                for (;;) {
-                    if (!(await authorize("fetch", `\n即将访问网页：\n${target.href}\n确认抓取？`))) return "已取消抓取";
-                    res = await fetch(target, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "manual" });
-                    const location = res.headers.get("location");
-                    if (!(res.status >= 300 && res.status < 400 && location)) break;
-                    await res.body?.cancel(); // 重定向响应没有可用内容，及时释放连接
-                    const next = new URL(location, target);
-                    if (next.protocol !== "http:" && next.protocol !== "https:")
-                        return `拒绝跟随非 http(s) 重定向：${next}`;
-                    if (visited.has(next.href)) return `检测到重定向循环：${next.href}`;
-                    if (visited.size >= MAX_FETCH_REDIRECTS) return `重定向超过 ${MAX_FETCH_REDIRECTS} 次，放弃`;
-                    visited.add(next.href);
-                    target = next;
-                }
-                if (!res.ok) {
-                    await res.body?.cancel(); // 不消费错误响应体，及时释放连接
-                    return `请求失败：HTTP ${res.status} ${res.statusText}`;
-                }
-                const contentType = res.headers.get("content-type") ?? "";
-                const isText =
-                    !contentType ||
-                    /^text\//i.test(contentType) ||
-                    /\/(?:json|javascript|xml|xhtml\+xml|rss\+xml|atom\+xml|ld\+json|csv)/i.test(contentType);
-                if (!isText) return `不支持的内容类型：${contentType}（只抓取文本类页面）`;
-                const text = decodeBody(await readBodyCapped(res, MAX_FETCH_BYTES), contentType);
-                const body = /html/i.test(contentType) ? htmlToText(text) : text;
-                const slice = body.slice(offset, offset + MAX_OUTPUT_CHARS);
+                const { text } = await fetchTextFromUrl(input, (url) =>
+                    authorize("fetch", `\n即将访问网页：\n${url}\n确认抓取？`),
+                );
+                const slice = text.slice(offset, offset + MAX_OUTPUT_CHARS);
                 if (!slice) return "offset 已越过内容末尾";
                 const hint =
-                    offset + slice.length < body.length
+                    offset + slice.length < text.length
                         ? `\n...(已读第 ${offset}-${offset + slice.length} 段，续读可用 offset=${offset + slice.length})`
                         : "";
                 return slice + hint;
             } catch (err) {
                 const e = err as Error;
+                if (e instanceof FetchCancelledError) return e.message;
                 return e.name === "TimeoutError"
                     ? `抓取超时（${FETCH_TIMEOUT_MS / 1000}s），可稍后重试`
                     : `抓取失败：${e.message}`;
@@ -402,7 +370,7 @@ function truncate(text: string): string {
 }
 
 /** 流式读取响应体，累计超过 max 字节就停止并断开剩余流，避免大响应把内存吃满。 */
-async function readBodyCapped(res: Response, max: number): Promise<Uint8Array> {
+export async function readBodyCapped(res: Response, max: number): Promise<Uint8Array> {
     if (!res.body) return new Uint8Array(0);
     const reader = res.body.getReader();
     const chunks: Uint8Array[] = [];
@@ -429,13 +397,71 @@ async function readBodyCapped(res: Response, max: number): Promise<Uint8Array> {
 }
 
 /** 按 content-type 里的 charset 解码；未声明按 UTF-8，字符集不认识也退回 UTF-8。 */
-function decodeBody(bytes: Uint8Array, contentType: string): string {
+export function decodeBody(bytes: Uint8Array, contentType: string): string {
     const charset = /charset=([\w-]+)/i.exec(contentType)?.[1] ?? "utf-8";
     try {
         return new TextDecoder(charset).decode(bytes);
     } catch {
         return new TextDecoder("utf-8").decode(bytes);
     }
+}
+
+/** 用户在某一跳（或入口）拒绝授权时抛出；调用方原样展示消息，不要再包「失败」前缀。 */
+export class FetchCancelledError extends Error {}
+
+/** 一次抓取的结果：HTML 已转纯文本的正文、转换前的原文（供提取 <title> 等）、最终落点 URL。 */
+export interface FetchedText {
+    text: string;
+    raw: string;
+    contentType: string;
+    finalUrl: string;
+}
+
+/**
+ * 抓取 URL 的共享核心（fetch 工具与 rag 采集共用，保证两条通道行为一致）：
+ * 手动跟随重定向且每一跳都经 authorizeHop 确认（堵 302 绕过授权）、流式读取并按
+ * MAX_FETCH_BYTES 截断、按 charset 解码、HTML 转纯文本。失败抛 Error，消息已按
+ * 用户可读口径写好，调用方直接展示即可。
+ */
+export async function fetchTextFromUrl(
+    input: string,
+    authorizeHop: (url: string) => Promise<boolean>,
+): Promise<FetchedText> {
+    let target: URL;
+    try {
+        target = new URL(input);
+    } catch {
+        throw new Error(`URL 不合法：${input}`);
+    }
+    if (target.protocol !== "http:" && target.protocol !== "https:") throw new Error("只支持 http/https 链接");
+    const visited = new Set([target.href]);
+    let res: Response;
+    for (;;) {
+        if (!(await authorizeHop(target.href))) throw new FetchCancelledError("已取消");
+        res = await fetch(target, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "manual" });
+        const location = res.headers.get("location");
+        if (!(res.status >= 300 && res.status < 400 && location)) break;
+        await res.body?.cancel(); // 重定向响应没有可用内容，及时释放连接
+        const next = new URL(location, target);
+        if (next.protocol !== "http:" && next.protocol !== "https:")
+            throw new Error(`拒绝跟随非 http(s) 重定向：${next}`);
+        if (visited.has(next.href)) throw new Error(`检测到重定向循环：${next.href}`);
+        if (visited.size >= MAX_FETCH_REDIRECTS) throw new Error(`重定向超过 ${MAX_FETCH_REDIRECTS} 次，放弃`);
+        visited.add(next.href);
+        target = next;
+    }
+    if (!res.ok) {
+        await res.body?.cancel(); // 不消费错误响应体，及时释放连接
+        throw new Error(`请求失败：HTTP ${res.status} ${res.statusText}`);
+    }
+    const contentType = res.headers.get("content-type") ?? "";
+    const isText =
+        !contentType ||
+        /^text\//i.test(contentType) ||
+        /\/(?:json|javascript|xml|xhtml\+xml|rss\+xml|atom\+xml|ld\+json|csv)/i.test(contentType);
+    if (!isText) throw new Error(`不支持的内容类型：${contentType}（只抓取文本类页面）`);
+    const raw = decodeBody(await readBodyCapped(res, MAX_FETCH_BYTES), contentType);
+    return { text: /html/i.test(contentType) ? htmlToText(raw) : raw, raw, contentType, finalUrl: target.href };
 }
 
 /**
@@ -480,25 +506,30 @@ async function searchTree(dir: string, pattern: string): Promise<string[]> {
  * 极简 HTML → 纯文本：剥掉脚本/样式/注释，块级标签换行，解码常见实体。
  * 不追求完整解析，够把文档、博文读成模型能用的文本。
  */
-function htmlToText(html: string): string {
-    return html
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        .replace(/<!--[\s\S]*?-->/g, "")
-        .replace(/<\/(?:p|div|h[1-6]|li|ul|ol|tr|td|th|table|pre|blockquote|section|article|header|footer)>/gi, "\n")
-        .replace(/<(?:br|hr)[\s\S]*?>/gi, "\n")
-        .replace(/<[^>]+>/g, "")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/&quot;/gi, '"')
-        .replace(/&#39;/gi, "'")
-        .replace(/&nbsp;/gi, " ")
-        // &amp; 必须最后解码，否则 &amp;lt; 这类页面上的字面转义会被二次解码成 <
-        .replace(/&amp;/gi, "&")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .join("\n");
+export function htmlToText(html: string): string {
+    return (
+        html
+            .replace(/<script[\s\S]*?<\/script>/gi, "")
+            .replace(/<style[\s\S]*?<\/style>/gi, "")
+            .replace(/<!--[\s\S]*?-->/g, "")
+            .replace(
+                /<\/(?:p|div|h[1-6]|li|ul|ol|tr|td|th|table|pre|blockquote|section|article|header|footer)>/gi,
+                "\n",
+            )
+            .replace(/<(?:br|hr)[\s\S]*?>/gi, "\n")
+            .replace(/<[^>]+>/g, "")
+            .replace(/&lt;/gi, "<")
+            .replace(/&gt;/gi, ">")
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/gi, "'")
+            .replace(/&nbsp;/gi, " ")
+            // &amp; 必须最后解码，否则 &amp;lt; 这类页面上的字面转义会被二次解码成 <
+            .replace(/&amp;/gi, "&")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .join("\n")
+    );
 }
 
 /** 按行拆文本：忽略结尾换行带来的空串；空文本返回空数组。 */

@@ -12,6 +12,7 @@ import { formatTodos, setupPlanning } from "./todos";
 import { listMemories, loadMemory, memoryBlocks, recallMemory, setupMemory } from "./memory";
 import { loadInstructions } from "./instructions";
 import { activeSkill, listSkills, loadSkills, unuseSkill, useSkill } from "./skills";
+import { addToRag, loadRag, ragStats, setupRag } from "./rag";
 
 // 模型上下文窗口（tokens）
 const CONTEXT_WINDOW = 64000;
@@ -43,6 +44,11 @@ try {
 } catch (e) {
     console.error(`项目指令（AGENTS.md）加载失败（忽略）：${(e as Error).message}`);
 }
+try {
+    await loadRag();
+} catch (e) {
+    console.error(`知识库读取失败（按空知识库继续）：${(e as Error).message}`);
+}
 const chat = new Chat(config.baseURL, config.apiKey, config.model, instructions);
 const sessions = new Sessions();
 await loadSkills();
@@ -55,6 +61,7 @@ let busy = false;
 const tui = new TUI(onLine, onExit);
 setupPlanning((task) => chat.delegate(task), updatePanel);
 setupMemory(updatePanel);
+setupRag(updatePanel);
 setupPermissions(permissions, (prompt) => tui.confirm(prompt));
 setConfirmFn((prompt) => tui.confirm(prompt));
 chat.setUsageListener((u) => {
@@ -215,6 +222,31 @@ async function handleCommand(line: string): Promise<void> {
             const memories = listMemories();
             const lines = memories.map((item, i) => `${i + 1}. ${item}`);
             tui.append(lines.length > 0 ? `长期记忆：\n${lines.join("\n")}` : "（暂无长期记忆）", "sys");
+            break;
+        }
+        case "/rag": {
+            const args = line.slice("/rag".length).trim();
+            if (!args) {
+                try {
+                    tui.append(ragStats(), "sys");
+                } catch (e) {
+                    tui.append(`知识库统计失败：${(e as Error).message}`, "sys");
+                }
+            } else if (args.startsWith("add ")) {
+                // 整个参数作为单一来源：按空白拆分会弄坏含空格的 Windows 路径
+                const src = args.slice(4).trim();
+                if (!src) {
+                    tui.append("用法：/rag add <网页 URL 或文件路径>", "sys");
+                } else {
+                    try {
+                        tui.append(`[${await addToRag(src)}]`, "tool");
+                    } catch (e) {
+                        tui.append(`采集失败：${(e as Error).message}`, "sys");
+                    }
+                }
+            } else {
+                tui.append("用法：/rag add <网页 URL 或文件路径> 采集建库；/rag 查看知识库", "sys");
+            }
             break;
         }
         case "/skills": {

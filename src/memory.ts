@@ -107,8 +107,9 @@ function termCount(text: string, term: string): number {
 /**
  * BM25-lite 打分：每个查询词按「tf × 平滑 idf」贡献分数，再用文档长度做归一。
  * 归一化文本和每个词的 df 各只算一次，整体 O(N × 词数)，不再逐块重复扫描全表。
+ * 记忆检索与知识库检索共用这一份实现，保证打分口径一致。
  */
-function scoreChunks(query: string[], chunks: Chunk[]): { chunk: Chunk; score: number }[] {
+export function scoreChunks(query: string[], chunks: Chunk[]): { chunk: Chunk; score: number }[] {
     const docs = chunks.map((c) => ({ chunk: c, doc: norm(c.text) }));
     const n = docs.length;
     const avgdl = docs.reduce((s, d) => s + d.doc.length, 0) / n;
@@ -224,7 +225,9 @@ export function setupMemory(changed: () => void): void {
                 if (!content) return "缺少参数 content";
                 // 超长按码点截断（Array.from 不会把代理对从中间切开），emoji 也能完整保留
                 const entry =
-                    content.length <= MAX_ENTRY_CHARS ? content : Array.from(content).slice(0, MAX_ENTRY_CHARS).join("");
+                    content.length <= MAX_ENTRY_CHARS
+                        ? content
+                        : Array.from(content).slice(0, MAX_ENTRY_CHARS).join("");
                 if (items.includes(entry)) return "这条记忆已经存在";
                 await saveToDisk([...items, entry]);
                 changed();
