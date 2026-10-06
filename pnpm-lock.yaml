@@ -207,6 +207,9 @@ importers:
       '@types/node':
         specifier: ^26.6.4
         version: 26.6.4
+      prettier:
+        specifier: ^3.9.9
+        version: 3.9.9
       tsx:
         specifier: ^4.23.15
         version: 4.23.15
@@ -534,6 +537,11 @@ packages:
       zod:
         optional: true
 
+  prettier@3.9.9:
+    resolution: {integrity: sha512-Z/CJHIkdujO/OtN7nXUii0Rf3VT5SRuhjBA82Xvu2XhBUgX3nhP67T0LHceBdQLex7OOFGTox+Q5Yg8Jk2Qivg==}
+    engines: {node: '>=14'}
+    hasBin: true
+
   tsx@4.23.15:
     resolution: {integrity: sha512-Yiex1Ovn8z2xPpOWckIiysV1SSyRMY9BkLF++q0yKiDxCqRhosKfMg3janKkiLBwZ5c/YryloKwGZcrEmtwxKw==}
     engines: {node: '>=18.0.0'}
@@ -726,6 +734,8 @@ snapshots:
     optional: true
 
   openai@7.28.0: {}
+
+  prettier@3.9.9: {}
 
   tsx@4.23.15:
     dependencies:
