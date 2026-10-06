@@ -8,6 +8,7 @@ import { setConfirmFn } from "./tools";
 import { estimateTokens, TUI } from "./tui";
 import { basename } from "path";
 import { undo } from "./undo";
+import { formatTodos, setupPlanning } from "./todos";
 
 // 模型上下文窗口（tokens）
 const CONTEXT_WINDOW = 64000;
@@ -36,6 +37,7 @@ const usage = { cum: 0, round: 0, live: 0 };
 let busy = false;
 
 const tui = new TUI(onLine, onExit);
+setupPlanning((task) => chat.delegate(task), updatePanel);
 setupPermissions(permissions, (prompt) => tui.confirm(prompt));
 setConfirmFn((prompt) => tui.confirm(prompt));
 chat.setUsageListener((u) => {
@@ -51,9 +53,11 @@ function buildPanel(): string[] {
     const ctx = estimateTokens(JSON.stringify(chat.exportHistory()));
     const root = permissionRoot();
     const shownRoot = visibleWidth(root) <= ROOT_DISPLAY_WIDTH ? root : `…/${basename(root)}`;
+    const todos = formatTodos();
     return [
         `模型  ${config.model}`,
         `会话  ${sessions.currentId()}`,
+        `根目录  ${shownRoot}`,
         "──── 上下文 ────",
         `${ctx} / ${window} tokens`,
         `${Math.ceil((ctx / window) * 100)}% used`,
@@ -61,6 +65,8 @@ function buildPanel(): string[] {
         `${usage.round + usage.live} tokens`,
         "──── 累计 ────",
         `${usage.cum} tokens`,
+        "──── TODO ────",
+        ...(todos.length > 0 ? todos : ["（暂无任务）"]),
     ];
 }
 
@@ -165,6 +171,11 @@ async function handleCommand(line: string): Promise<void> {
                 tui.append(`撤销失败：${(e as Error).message}`, "sys");
             }
             break;
+        case "/todos": {
+            const todos = formatTodos();
+            tui.append(todos.length > 0 ? `TODO：\n${todos.join("\n")}` : "（暂无 TODO）", "sys");
+            break;
+        }
         case "/exit":
             await onExit();
             break;
