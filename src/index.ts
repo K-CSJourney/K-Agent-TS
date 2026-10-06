@@ -1,7 +1,8 @@
-import { createInterface } from "node:readline";
+import { createInterface } from "node:readline/promises";
 import { Chat } from "./chat";
 import { loadConfig } from "./config";
 import { err, out, paint } from "./color";
+import { installCliConfirm } from "./tools";
 
 const config = loadConfig();
 const chat = new Chat(config.baseURL, config.apiKey, config.model);
@@ -24,6 +25,8 @@ function printHelp(): void {
         true,
     );
 }
+
+installCliConfirm(rl);
 
 rl.on("line", async (raw) => {
     if (busy) return; // 上一轮还在流式输出，忽略连发输入
