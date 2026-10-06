@@ -3,8 +3,8 @@ import { Interface as Readline } from "node:readline/promises";
 import { promisify } from "node:util";
 import { ChatCompletionTool } from "openai/resources/chat/completions";
 import { out } from "./color";
-import { glob, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { glob, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 import { authorize, permissionRoot, policyFor, redact, safeGlob, safePath } from "./permissions";
 import { backup } from "./undo";
 
@@ -18,6 +18,19 @@ const MAX_OUTPUT_CHARS = 2000;
 const MAX_GLOB_RESULTS = 200;
 // 写入前diff预览最多展示的行数，避免整文件覆盖时刷屏
 const MAX_DIFF_LINES = 100;
+/** search 最多返回的命中行数，命中太多说明关键词不够聚焦。 */
+const MAX_SEARCH_RESULTS = 50;
+/** search 只扫不超过这个字节数的文本文件，跳过体积可疑的大文件。 */
+const MAX_SEARCH_FILE_SIZE = 1024 * 1024;
+/** fetch 最长的等待时间，超时按失败处理。 */
+const FETCH_TIMEOUT_MS = 15_000;
+/** fetch 单次最多缓冲的字节数，防止大响应把内存吃满（展示本来就只取片段）。 */
+const MAX_FETCH_BYTES = 2 * 1024 * 1024;
+/** fetch 最多跟随的重定向次数，防循环跳转。 */
+const MAX_FETCH_REDIRECTS = 5;
+
+/** 遍历时跳过 node_modules 与隐藏目录；glob 与 search 共用同一套排除规则，避免两套逻辑各自漂移。 */
+const skipDir = (dir: string) => dir.split(/[\\/]+/).some((seg) => seg === "node_modules" || seg.startsWith("."));
 
 // patch 的单个修改片段：把文件中唯一出现的 old 替换为 new
 interface PatchHunk {
@@ -184,7 +197,7 @@ export const BUILTIN_TOOLS: Tool[] = [
                 const files: string[] = [];
                 for await (const p of glob(pattern, {
                     cwd: permissionRoot(),
-                    exclude: (dir) => dir.includes("node_modules"),
+                    exclude: skipDir,
                 })) {
                     files.push(p.replaceAll("\\", "/"));
                     if (files.length >= MAX_GLOB_RESULTS) break;
@@ -200,6 +213,107 @@ export const BUILTIN_TOOLS: Tool[] = [
                 return `glob 失败：${(err as Error).message}`;
             }
         },
+    },
+    {
+        name: "search",
+        description:
+            "在仓库内按内容检索代码（忽略大小写）。返回 相对路径:行号: 内容，适合找「哪个文件里出现了某段文字/某个调用」。默认跳过 node_modules、隐藏路径、二进制与大于 1MB 的文件。",
+        parameters: {
+            type: "object",
+            properties: {
+                pattern: { type: "string", description: '要检索的关键词，如 "safePath"、一个函数名或一行报错文案。' },
+                path: { type: "string", description: "要检索的相对目录，默认整个仓库根目录；传子目录可加快速度。" },
+            },
+            required: ["pattern"],
+            additionalProperties: false,
+        },
+        run: async (args) => {
+            const pattern = String(args.pattern ?? "").trim();
+            if (!pattern) return "缺少参数 pattern";
+            const sub = String(args.path ?? "").trim();
+            try {
+                const dir = sub ? await safePath(sub) : permissionRoot();
+                const hits = await searchTree(dir, pattern.toLowerCase());
+                // searchTree 会多收集一条用于区分「恰好到底」和「真的被截断」
+                const truncated = hits.length > MAX_SEARCH_RESULTS;
+                const shown = truncated ? hits.slice(0, MAX_SEARCH_RESULTS) : hits;
+                if (shown.length === 0) return `没有匹配 "${pattern}"${sub ? `（在 ${sub} 下）` : ""}`;
+                const hint = truncated ? `\n...(已达上限 ${MAX_SEARCH_RESULTS} 行，换更聚焦的关键词再搜)` : "";
+                return `匹配 "${pattern}" ${shown.length}${truncated ? "+" : ""} 行：\n${shown.join("\n")}${hint}`;
+            } catch (err) {
+                return `search 失败：${(err as Error).message}`;
+            }
+        },
+    },
+    {
+        name: "fetch",
+        description:
+            "抓取一个网页并转成纯文本，让模型看到仓库之外的信息（文档、博文、报错页等）。默认 ask 策略，每次访问（含重定向的每一跳）都需确认；只支持 http/https，非文本内容与超过 2MB 的响应会被拒绝，长页面可用 offset 分段续读。",
+        parameters: {
+            type: "object",
+            properties: {
+                url: { type: "string", description: "要访问的完整网址，以 http:// 或 https:// 开头。" },
+                offset: { type: "number", description: "从第 offset 个字符开始读，默认 0；用于分段读长页面。" },
+            },
+            required: ["url"],
+            additionalProperties: false,
+        },
+        run: async (args) => {
+            const input = String(args.url ?? "").trim();
+            if (!input) return "缺少参数 url";
+            const offset = Math.max(0, Number(args.offset) || 0);
+            let target: URL;
+            try {
+                target = new URL(input);
+            } catch {
+                return `URL 不合法：${input}`;
+            }
+            if (target.protocol !== "http:" && target.protocol !== "https:") return "只支持 http/https 链接";
+            try {
+                // 重定向手动跟随：每一跳都是新地址，必须重新确认，不能让 302 绕过按 URL 的授权
+                const visited = new Set([target.href]);
+                let res: Response;
+                for (;;) {
+                    if (!(await authorize("fetch", `\n即将访问网页：\n${target.href}\n确认抓取？`))) return "已取消抓取";
+                    res = await fetch(target, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "manual" });
+                    const location = res.headers.get("location");
+                    if (!(res.status >= 300 && res.status < 400 && location)) break;
+                    await res.body?.cancel(); // 重定向响应没有可用内容，及时释放连接
+                    const next = new URL(location, target);
+                    if (next.protocol !== "http:" && next.protocol !== "https:")
+                        return `拒绝跟随非 http(s) 重定向：${next}`;
+                    if (visited.has(next.href)) return `检测到重定向循环：${next.href}`;
+                    if (visited.size >= MAX_FETCH_REDIRECTS) return `重定向超过 ${MAX_FETCH_REDIRECTS} 次，放弃`;
+                    visited.add(next.href);
+                    target = next;
+                }
+                if (!res.ok) {
+                    await res.body?.cancel(); // 不消费错误响应体，及时释放连接
+                    return `请求失败：HTTP ${res.status} ${res.statusText}`;
+                }
+                const contentType = res.headers.get("content-type") ?? "";
+                const isText =
+                    !contentType ||
+                    /^text\//i.test(contentType) ||
+                    /\/(?:json|javascript|xml|xhtml\+xml|rss\+xml|atom\+xml|ld\+json|csv)/i.test(contentType);
+                if (!isText) return `不支持的内容类型：${contentType}（只抓取文本类页面）`;
+                const text = decodeBody(await readBodyCapped(res, MAX_FETCH_BYTES), contentType);
+                const body = /html/i.test(contentType) ? htmlToText(text) : text;
+                const slice = body.slice(offset, offset + MAX_OUTPUT_CHARS);
+                if (!slice) return "offset 已越过内容末尾";
+                const hint =
+                    offset + slice.length < body.length
+                        ? `\n...(已读第 ${offset}-${offset + slice.length} 段，续读可用 offset=${offset + slice.length})`
+                        : "";
+                return slice + hint;
+            } catch (err) {
+                const e = err as Error;
+                return e.name === "TimeoutError"
+                    ? `抓取超时（${FETCH_TIMEOUT_MS / 1000}s），可稍后重试`
+                    : `抓取失败：${e.message}`;
+            }
+        },
+        authorizes: true,
     },
     {
         name: "write",
@@ -285,6 +399,106 @@ BUILTIN_TOOLS.forEach(registerTool);
 function truncate(text: string): string {
     if (text.length <= MAX_OUTPUT_CHARS) return text;
     return `${text.slice(0, MAX_OUTPUT_CHARS)}\n...(输出已截断, 原共 ${text.length} 字符)`;
+}
+
+/** 流式读取响应体，累计超过 max 字节就停止并断开剩余流，避免大响应把内存吃满。 */
+async function readBodyCapped(res: Response, max: number): Promise<Uint8Array> {
+    if (!res.body) return new Uint8Array(0);
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.byteLength;
+        if (total >= max) {
+            await reader.cancel();
+            break;
+        }
+    }
+    const out = new Uint8Array(Math.min(total, max));
+    let filled = 0;
+    for (const chunk of chunks) {
+        if (filled >= out.length) break;
+        const size = Math.min(chunk.byteLength, out.length - filled);
+        out.set(chunk.subarray(0, size), filled);
+        filled += size;
+    }
+    return out;
+}
+
+/** 按 content-type 里的 charset 解码；未声明按 UTF-8，字符集不认识也退回 UTF-8。 */
+function decodeBody(bytes: Uint8Array, contentType: string): string {
+    const charset = /charset=([\w-]+)/i.exec(contentType)?.[1] ?? "utf-8";
+    try {
+        return new TextDecoder(charset).decode(bytes);
+    } catch {
+        return new TextDecoder("utf-8").decode(bytes);
+    }
+}
+
+/**
+ * 在 dir 目录内按内容检索：用 Node 内置 glob 枚举文件（默认跳过隐藏路径与 node_modules），
+ * 跳过二进制（含空字节）与过大的文件，逐行做忽略大小写的包含匹配，凑满上限即停。
+ * 返回「相对 root 的路径:行号: 内容」列表，格式照搬 ripgrep。
+ */
+async function searchTree(dir: string, pattern: string): Promise<string[]> {
+    const root = permissionRoot();
+    const hits: string[] = [];
+    for await (const p of glob("**/*", {
+        cwd: dir,
+        exclude: skipDir,
+    })) {
+        // 上限之外多收集一条，调用方据此区分「恰好到底」和「被截断」
+        if (hits.length > MAX_SEARCH_RESULTS) break;
+        const file = join(dir, p);
+        const rel = relative(root, file).replaceAll("\\", "/");
+        let st;
+        try {
+            st = await stat(file);
+        } catch {
+            continue; // 文件可能在被遍历时被删除
+        }
+        if (!st.isFile() || st.size > MAX_SEARCH_FILE_SIZE) continue;
+        let text: string;
+        try {
+            text = await readFile(file, "utf8");
+        } catch {
+            continue;
+        }
+        if (text.includes("\0")) continue; // 含空字节基本是二进制，跳过
+        text.split("\n").forEach((line, i) => {
+            if (hits.length > MAX_SEARCH_RESULTS) return;
+            if (line.toLowerCase().includes(pattern)) hits.push(`${rel}:${i + 1}: ${line.trimEnd()}`);
+        });
+    }
+    return hits;
+}
+
+/**
+ * 极简 HTML → 纯文本：剥掉脚本/样式/注释，块级标签换行，解码常见实体。
+ * 不追求完整解析，够把文档、博文读成模型能用的文本。
+ */
+function htmlToText(html: string): string {
+    return html
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/<\/(?:p|div|h[1-6]|li|ul|ol|tr|td|th|table|pre|blockquote|section|article|header|footer)>/gi, "\n")
+        .replace(/<(?:br|hr)[\s\S]*?>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/&nbsp;/gi, " ")
+        // &amp; 必须最后解码，否则 &amp;lt; 这类页面上的字面转义会被二次解码成 <
+        .replace(/&amp;/gi, "&")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join("\n");
 }
 
 /** 按行拆文本：忽略结尾换行带来的空串；空文本返回空数组。 */

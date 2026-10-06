@@ -14,6 +14,8 @@ const DEFAULT_TOOLS: Record<string, Policy> = {
     ls: "allow",
     read: "allow",
     glob: "allow",
+    search: "allow",
+    fetch: "ask",
     write: "ask",
     patch: "ask",
     todo_write: "allow",
